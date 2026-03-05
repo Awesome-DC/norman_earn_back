@@ -851,19 +851,25 @@ def claim_daily_bonus():
     now  = datetime.utcnow()
     BONUS_GEMS = 5.0
 
-    # Check if already claimed today (compare date only, not time)
+    # Must wait 24 hours from account creation before first claim
+    hours_since_signup = (now - user.created_at).total_seconds() / 3600
+    if hours_since_signup < 24:
+        secs_left = int((24 * 3600) - (now - user.created_at).total_seconds())
+        return jsonify({
+            "success":    False,
+            "message":    "You must wait 24 hours after signup to claim your first bonus.",
+            "next_claim": secs_left,
+        }), 400
+
+    # Check if already claimed in last 24 hours
     if user.last_bonus_claim:
-        last = user.last_bonus_claim
-        # Same calendar day in UTC = already claimed
-        if last.date() >= now.date():
-            # Calculate seconds until midnight UTC
-            from datetime import timezone
-            midnight = datetime(now.year, now.month, now.day, 23, 59, 59)
-            secs_left = int((midnight - now).total_seconds()) + 1
+        secs_since = (now - user.last_bonus_claim).total_seconds()
+        if secs_since < 86400:
+            secs_left = int(86400 - secs_since)
             return jsonify({
                 "success":    False,
-                "message":    "Already claimed today.",
-                "next_claim": secs_left,  # seconds until they can claim again
+                "message":    "Already claimed. Come back in 24 hours.",
+                "next_claim": secs_left,
             }), 400
 
     # Credit bonus
@@ -878,6 +884,114 @@ def claim_daily_bonus():
         "gems":     BONUS_GEMS,
         "balance":  user.balance,
     })
+
+
+
+# ══════════════════════════════════════════
+#  DAILY QUEST — Get active quest
+# ══════════════════════════════════════════
+@main_routes.route('/api/daily-quest', methods=['GET'])
+@require_auth
+def get_daily_quest():
+    user  = request.current_user
+    quest = DailyQuest.query.filter_by(is_active=True).order_by(DailyQuest.created_at.desc()).first()
+    if not quest:
+        return jsonify({"success": True, "quest": None})
+
+    import json
+    winners = json.loads(quest.winners or "[]")
+    already_won = user.username in winners
+    all_claimed = len(winners) >= quest.max_winners
+
+    return jsonify({
+        "success": True,
+        "quest": {
+            "id":            quest.id,
+            "question":      quest.question,
+            "reward_gems":   quest.reward_gems,
+            "max_winners":   quest.max_winners,
+            "winners_count": len(winners),
+            "already_won":   already_won,
+            "all_claimed":   all_claimed,
+            "is_active":     quest.is_active,
+        }
+    })
+
+
+# ══════════════════════════════════════════
+#  DAILY QUEST — Submit answer
+# ══════════════════════════════════════════
+@main_routes.route('/api/daily-quest/answer', methods=['POST'])
+@require_auth
+def answer_daily_quest():
+    user  = request.current_user
+    data  = request.get_json()
+    answer = (data.get('answer') or '').strip().lower()
+
+    quest = DailyQuest.query.filter_by(is_active=True).order_by(DailyQuest.created_at.desc()).first()
+    if not quest:
+        return jsonify({"success": False, "message": "No active quest right now."}), 404
+
+    import json
+    winners = json.loads(quest.winners or "[]")
+
+    if user.username in winners:
+        return jsonify({"success": False, "message": "You already claimed this quest reward!"}), 400
+
+    if len(winners) >= quest.max_winners:
+        return jsonify({"success": False, "message": "All rewards claimed! Try again tomorrow."}), 400
+
+    if answer != quest.answer.strip().lower():
+        return jsonify({"success": False, "message": "Wrong answer. Try again!"}), 400
+
+    # Correct answer — credit reward
+    winners.append(user.username)
+    quest.winners = json.dumps(winners)
+    if len(winners) >= quest.max_winners:
+        quest.is_active = False
+
+    user.balance      += quest.reward_gems
+    user.total_earned += quest.reward_gems
+    db.session.commit()
+
+    return jsonify({
+        "success":     True,
+        "message":     f"Correct! +{quest.reward_gems:.0f} gems credited!",
+        "gems":        quest.reward_gems,
+        "balance":     user.balance,
+        "winners_left": quest.max_winners - len(winners),
+    })
+
+
+# ══════════════════════════════════════════
+#  DAILY QUEST — Admin create (called from Telegram bot via HTTP)
+# ══════════════════════════════════════════
+@main_routes.route('/api/admin/daily-quest', methods=['POST'])
+@require_admin
+def create_daily_quest():
+    data        = request.get_json()
+    question    = (data.get('question')   or '').strip()
+    answer      = (data.get('answer')     or '').strip().lower()
+    reward_gems = float(data.get('reward_gems', 10))
+    max_winners = int(data.get('max_winners', 10))
+
+    if not question or not answer:
+        return jsonify({"success": False, "message": "Question and answer required."}), 400
+
+    # Deactivate any existing active quest
+    DailyQuest.query.filter_by(is_active=True).update({"is_active": False})
+
+    quest = DailyQuest(
+        question=question,
+        answer=answer,
+        reward_gems=reward_gems,
+        max_winners=max_winners,
+        is_active=True,
+    )
+    db.session.add(quest)
+    db.session.commit()
+
+    return jsonify({"success": True, "message": "Daily quest created!", "quest": quest.to_dict()})
 
 
 # ══════════════════════════════════════════
