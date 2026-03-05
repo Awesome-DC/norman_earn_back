@@ -243,19 +243,14 @@ def create_user():
         referrer = User.query.filter_by(referral_code=ref_code).first()
         if not referrer:
             return jsonify({"success": False, "message": "Invalid referral code."}), 400
-        if not referrer.is_verified:
-            return jsonify({"success": False, "message": "Referral code belongs to an unverified account."}), 400
-
-    otp         = gen_otp()
-    otp_expires = datetime.utcnow() + timedelta(minutes=15)
+        # referrer verification check removed - all users auto-verified
 
     new_user = User(
         username=username,
         email=email,
         phone=phone,
         password=generate_password_hash(password),
-        otp_code=otp,
-        otp_expires=otp_expires,
+        is_verified=True,
         referral_code=gen_referral_code(username),
         referred_by=ref_code if referrer else None,
         balance=2.0,
@@ -263,19 +258,28 @@ def create_user():
         upgrades_owned="{}",
     )
     db.session.add(new_user)
+
+    # Credit referrer if valid
+    if referrer:
+        referrer.balance      += 10.0
+        referrer.total_earned += 10.0
+
     db.session.commit()
 
-    try:
-        send_otp_email(new_user, otp,
-            subject="🔑 Your Norman-Earn Verification Code",
-            heading=f"Hey {new_user.username}! 👋",
-            body_text="Use the code below to verify your email and start mining gems."
-        )
-    except Exception as e:
-        print(f"[EMAIL ERROR]: {e}")
-        return jsonify({"success": True, "message": "Account created but email failed.", "email": email, "email_error": True}), 201
+    # Generate token and log user in immediately
+    import secrets
+    token = secrets.token_hex(32)
+    new_user.session_token = token
+    new_user.token_created = datetime.utcnow()
+    db.session.commit()
 
-    return jsonify({"success": True, "message": f"Code sent to {email}.", "email": email}), 201
+    print(f"[SIGNUP] {username} registered and auto-logged in")
+    return jsonify({
+        "success": True,
+        "message": "Account created! Welcome to Norman-Earn.",
+        "token": token,
+        "user": new_user.to_dict()
+    }), 201
 
 
 # ══════════════════════════════════════════
