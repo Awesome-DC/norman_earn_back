@@ -976,33 +976,41 @@ def forgot_password():
         return jsonify({"success": False,
             "message": f"Too many attempts. Try again in {retry//60+1} minute(s)."}), 429
 
-    # Try to find the user — must match on at least 2 provided fields
+    # Try to find user — case-insensitive username search for PostgreSQL
     user = None
     matches = 0
 
-    # Build candidates from each provided field
-    candidates = set()
-    if username:
-        u = User.query.filter_by(username=username).first()
-        if u: candidates.add(u.id)
-    if email:
-        u = User.query.filter_by(email=email).first()
-        if u: candidates.add(u.id)
-    if phone:
-        u = User.query.filter_by(phone=phone).first()
-        if u: candidates.add(u.id)
+    found_by_username = None
+    found_by_email    = None
+    found_by_phone    = None
 
-    # If all provided fields point to same user, count how many matched
-    if len(candidates) == 1:
-        uid  = next(iter(candidates))
-        user = User.query.get(uid)
-        # Count how many of the provided fields actually match this user
-        if username and user.username.lower() == username: matches += 1
-        if email    and user.email.lower()    == email:    matches += 1
-        if phone    and user.phone            == phone:    matches += 1
+    if username:
+        # Case-insensitive search
+        found_by_username = User.query.filter(
+            db.func.lower(User.username) == username.lower()
+        ).first()
+
+    if email:
+        found_by_email = User.query.filter(
+            db.func.lower(User.email) == email.lower()
+        ).first()
+
+    if phone:
+        found_by_phone = User.query.filter_by(phone=phone).first()
+
+    # Collect all found users, count matches per user
+    found_users = {}
+    for u in [found_by_username, found_by_email, found_by_phone]:
+        if u:
+            found_users[u.id] = found_users.get(u.id, 0) + 1
+
+    # Pick the user with the most matches
+    if found_users:
+        best_id = max(found_users, key=lambda uid: found_users[uid])
+        matches = found_users[best_id]
+        user    = User.query.get(best_id)
 
     if not user or matches < 2:
-        # Vague error — don't reveal which field is wrong
         return jsonify({"success": False,
             "message": "Could not verify identity. Check your details and try again."}), 404
 
