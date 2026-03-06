@@ -272,19 +272,10 @@ def calc_gems_per_hr(upgrades_json):
 # ══════════════════════════════════════════
 @main_routes.route('/api/users', methods=['POST'])
 def create_user():
-    # IP rate limit: 5 signups per IP per day
     # Get real IP — Railway/Render proxy sets X-Forwarded-For
     ip = (request.headers.get('X-Forwarded-For') or request.remote_addr or '').split(',')[0].strip()
-    # Max 2 signups per IP per day (down from 5)
-    allowed, retry = rate_limit(f'signup_{ip}', 2, 86400)
-    if not allowed:
-        send_security_alert("rate_limit", {
-            "ip": ip,
-            "reason": f"IP {ip} hit signup rate limit (2/day) — possible bot/spam"
-        })
-        return jsonify({"success": False,
-            "message": "Too many signups from your network today. Try again tomorrow."}), 429
 
+    # Parse body first so we can include user details in alerts
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "No data received."}), 400
@@ -294,6 +285,19 @@ def create_user():
     phone    = (data.get('phone')    or '').strip()
     password = (data.get('password') or '')
     ref_code = (data.get('referral_code') or '').strip().upper()
+
+    # Max 2 signups per IP per day
+    allowed, retry = rate_limit(f'signup_{ip}', 2, 86400)
+    if not allowed:
+        send_security_alert("rate_limit", {
+            "username": username or "unknown",
+            "email":    email    or "unknown",
+            "ip":       ip,
+            "ref_code": ref_code or "none",
+            "reason":   f"Hit signup rate limit (2/day) — possible bot/spam"
+        })
+        return jsonify({"success": False,
+            "message": "Too many signups from your network today. Try again tomorrow."}), 429
 
     if not all([username, email, phone, password]):
         return jsonify({"success": False, "message": "All fields are required."}), 400
@@ -712,7 +716,7 @@ def buy_upgrade():
                         "username": user.username, "email": user.email,
                         "ip": user.signup_ip, "ref_code": user.referred_by,
                         "referrer": referrer.username,
-                        "reason": f"Account only {account_age_hours:.1f}h old — referral bonus blocked"
+                        "reason": f"Bonus blocked — suspicious activity (account age {account_age_hours:.1f}h, minimum 24h required)"
                     })
                 # Check 2: referred user and referrer must not share IP
                 elif user.signup_ip and referrer.signup_ip and user.signup_ip == referrer.signup_ip:
@@ -720,7 +724,7 @@ def buy_upgrade():
                         "username": user.username, "email": user.email,
                         "ip": user.signup_ip, "ref_code": user.referred_by,
                         "referrer": referrer.username,
-                        "reason": "Referred user shares IP with referrer — bonus blocked"
+                        "reason": "Bonus blocked — suspicious activity (referred user IP matches referrer IP)"
                     })
                 # Check 3: referrer must have been active (has mined something)
                 elif referrer.total_earned < 2.0:
@@ -1018,11 +1022,29 @@ def delete_account():
     if not check_password_hash(user.password, password):
         return jsonify({"success": False, "message": "Incorrect password."}), 401
 
-    # Delete withdrawal records too
-    WithdrawalRequest.query.filter_by(username=user.username).delete()
-    db.session.delete(user)
-    db.session.commit()
-    return jsonify({"success": True, "message": "Account deleted."})
+    try:
+        # Delete all related records first
+        WithdrawalRequest.query.filter_by(username=user.username).delete()
+
+        # Remove username from any daily quest winner lists
+        quests = DailyQuest.query.all()
+        for q in quests:
+            import json as _json
+            winners = _json.loads(q.winners or "[]")
+            if user.username in winners:
+                winners.remove(user.username)
+                q.winners = _json.dumps(winners)
+
+        # Nullify referred_by for users they referred (keep their accounts)
+        User.query.filter_by(referred_by=user.referral_code).update({"referred_by": None})
+
+        db.session.delete(user)
+        db.session.commit()
+        return jsonify({"success": True, "message": "Account deleted."})
+    except Exception as e:
+        db.session.rollback()
+        print(f"[DELETE ERROR] {e}")
+        return jsonify({"success": False, "message": "Failed to delete account. Please try again."}), 500
 
 
 # ══════════════════════════════════════════
