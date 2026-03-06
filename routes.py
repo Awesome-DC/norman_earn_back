@@ -205,7 +205,8 @@ def calc_gems_per_hr(upgrades_json):
 def create_user():
     # IP rate limit: 5 signups per IP per day
     ip = request.remote_addr
-    allowed, retry = rate_limit(f'signup_{ip}', 5, 86400)
+    # Max 2 signups per IP per day (down from 5)
+    allowed, retry = rate_limit(f'signup_{ip}', 2, 86400)
     if not allowed:
         return jsonify({"success": False,
             "message": "Too many signups from your network today. Try again tomorrow."}), 429
@@ -243,7 +244,9 @@ def create_user():
         referrer = User.query.filter_by(referral_code=ref_code).first()
         if not referrer:
             return jsonify({"success": False, "message": "Invalid referral code."}), 400
-        # referrer verification check removed - all users auto-verified
+        # Prevent self-referral
+        if referrer.email == email or referrer.phone == phone:
+            return jsonify({"success": False, "message": "You cannot refer yourself."}), 400
 
     new_user = User(
         username=username,
@@ -473,37 +476,89 @@ def get_profile():
 # ══════════════════════════════════════════
 #  SYNC MINING STATE — save balance/upgrades/mining_start to DB
 # ══════════════════════════════════════════
+# ── Mining constants (must match frontend) ──
+BASE_GEMS_PER_SECOND = (10 / 24) / 3600   # 10 gems/day → per second
+MAX_SINGLE_CYCLE     = 10.5                # max gems one 24hr cycle can earn
+
 @main_routes.route('/api/sync', methods=['POST'])
 @require_auth
 def sync_state():
     user = request.current_user
     data = request.get_json()
+    now  = datetime.utcnow()
 
-    old_total = user.total_earned
-
-    if 'balance' in data:
-        user.balance = float(data['balance'])
-    if 'total_earned' in data:
-        user.total_earned = float(data['total_earned'])
+    # ── ONLY accept upgrades_owned and mining_start from frontend ──
+    # NEVER trust balance or total_earned from client
     if 'upgrades_owned' in data:
-        user.upgrades_owned = json.dumps(data['upgrades_owned'])
+        raw = data['upgrades_owned']
+        # Validate it's a dict of known upgrade keys only
+        VALID_KEYS = {'t1','t2','t3','t4','t5','t6','w1','w2','w3','w4','w5','w6','m1','m2','m3','m4','m5','m6'}
+        if isinstance(raw, dict):
+            clean = {}
+            for k, v in raw.items():
+                if k in VALID_KEYS and isinstance(v, (int, float)) and 0 <= v <= 10000:
+                    clean[k] = int(v)
+            user.upgrades_owned = json.dumps(clean)
+
     if 'mining_start' in data:
         ms = data['mining_start']
-        user.mining_start = datetime.fromisoformat(ms) if ms else None
+        if ms:
+            try:
+                start = datetime.fromisoformat(ms)
+                # Reject if mining_start is in the future or more than 25hrs ago
+                diff_hours = (now - start).total_seconds() / 3600
+                if -0.1 <= diff_hours <= 25:
+                    user.mining_start = start
+                else:
+                    print(f'[SECURITY] {user.username} sent suspicious mining_start: {diff_hours:.1f}h ago')
+            except Exception:
+                pass
+        else:
+            # mining stopped — calculate gems earned server-side
+            if user.mining_start:
+                elapsed = (now - user.mining_start).total_seconds()
+                # Cap at 24hr cycle
+                elapsed = min(elapsed, 86400)
 
-    # ── 10% referral cut: when total_earned increases, give 10% to referrer ──
-    new_total = user.total_earned
-    if user.referred_by and new_total > old_total:
-        gems_earned = new_total - old_total
-        cut = round(gems_earned * 0.10, 6)
-        referrer = User.query.filter_by(referral_code=user.referred_by).first()
-        if referrer and cut > 0:
-            referrer.balance      += cut
-            referrer.total_earned += cut
-            print(f'[REFERRAL CUT] {referrer.username} earned +{cut:.4f} gems (10% of {user.username} mined {gems_earned:.4f})')
+                # Calculate boost from upgrades
+                owned = json.loads(user.upgrades_owned or '{}')
+                BOOSTS = {
+                    't1':0.05,'t2':0.12,'t3':0.28,'t4':0.55,'t5':2.0,'t6':4.5,
+                    'w1':0.06,'w2':0.14,'w3':0.32,'w4':0.65,'w5':2.8,'w6':5.5,
+                    'm1':0.08,'m2':0.16,'m3':0.42,'m4':0.80,'m5':3.2,'m6':6.5,
+                }
+                boost = sum(BOOSTS.get(k, 0) * v for k, v in owned.items())
+                rate = BASE_GEMS_PER_SECOND * (1 + boost)
+                gems_earned = round(rate * elapsed, 6)
+
+                # Cap earned gems to prevent abuse
+                MAX_RATE_BOOST = sum(BOOSTS.values()) * 10000  # absolute max
+                max_possible = BASE_GEMS_PER_SECOND * (1 + MAX_RATE_BOOST) * 86400
+                gems_earned = min(gems_earned, max_possible)
+
+                old_total = user.total_earned
+                user.balance      += gems_earned
+                user.total_earned += gems_earned
+                user.mining_start  = None
+
+                # ── 10% referral cut ──
+                if user.referred_by and gems_earned > 0:
+                    cut = round(gems_earned * 0.10, 6)
+                    referrer = User.query.filter_by(referral_code=user.referred_by).first()
+                    if referrer and cut > 0:
+                        referrer.balance      += cut
+                        referrer.total_earned += cut
+                        print(f'[REFERRAL CUT] {referrer.username} +{cut:.4f} gems')
+
+                print(f'[MINING] {user.username} earned {gems_earned:.4f} gems in {elapsed:.0f}s')
 
     db.session.commit()
-    return jsonify({"success": True, "message": "State synced."})
+    return jsonify({
+        "success":      True,
+        "message":      "State synced.",
+        "balance":      user.balance,
+        "total_earned": user.total_earned,
+    })
 
 
 # ══════════════════════════════════════════
@@ -635,6 +690,7 @@ def reset_password():
 def withdraw():
     user = request.current_user
     data = request.get_json()
+    now  = datetime.utcnow()
 
     network = (data.get('network') or '').strip()
     wallet  = (data.get('wallet')  or '').strip()
@@ -642,10 +698,35 @@ def withdraw():
 
     if not network or not wallet:
         return jsonify({"success": False, "message": "Network and wallet address are required."}), 400
+
+    # ── Fraud checks ──
+    # 1. Account must be at least 7 days old
+    account_age_days = (now - user.created_at).days
+    if account_age_days < 7:
+        return jsonify({"success": False, "message": f"Account must be at least 7 days old to withdraw. ({7 - account_age_days} days remaining)"}), 403
+
+    # 2. Must have iron pickaxe (paid upgrade)
+    if not user.has_iron_pickaxe:
+        return jsonify({"success": False, "message": "You must own the Iron Pickaxe upgrade to withdraw."}), 403
+
+    # 3. Rate limit — max 1 withdrawal per 24 hours per user
+    allowed, retry = rate_limit(f'withdraw_{user.username}', 1, 86400)
+    if not allowed:
+        return jsonify({"success": False, "message": f"You can only withdraw once per 24 hours. Try again in {retry//3600+1}h."}), 429
+
+    # 4. Minimum withdrawal
     if gems < 50:
         return jsonify({"success": False, "message": "Minimum withdrawal is 50 gems."}), 400
+
+    # 5. Can't withdraw more than actual balance
     if gems > user.balance:
         return jsonify({"success": False, "message": "Insufficient balance."}), 400
+
+    # 6. Balance sanity check — flag suspiciously high balances
+    MAX_LEGIT_BALANCE = 100000  # adjust as needed
+    if user.balance > MAX_LEGIT_BALANCE:
+        print(f'[FRAUD ALERT] {user.username} has suspicious balance: {user.balance:.2f} gems')
+        return jsonify({"success": False, "message": "Your account has been flagged for review. Contact support."}), 403
 
     # 5% transaction fee — deduct full amount, user receives 95%
     fee_gems  = round(gems * 0.05, 4)
@@ -1125,8 +1206,15 @@ def admin_update_user(user_id):
     if 'is_verified'    in data: user.is_verified    = bool(data['is_verified'])
     if 'is_admin'       in data: user.is_admin       = bool(data['is_admin'])
     if 'has_iron_pickaxe' in data: user.has_iron_pickaxe = bool(data['has_iron_pickaxe'])
-    if 'balance'        in data: user.balance        = float(data['balance'])
-    if 'total_earned'   in data: user.total_earned   = float(data['total_earned'])
+    # Balance can only be set by verified admin — extra check
+    if 'balance' in data:
+        if not request.current_user.is_admin:
+            return jsonify({'success': False, 'message': 'Unauthorized.'}), 403
+        user.balance = float(data['balance'])
+    if 'total_earned' in data:
+        if not request.current_user.is_admin:
+            return jsonify({'success': False, 'message': 'Unauthorized.'}), 403
+        user.total_earned = float(data['total_earned'])
 
     # Ban = wipe session token so they get kicked out immediately
     if data.get('ban'):
