@@ -244,9 +244,25 @@ def create_user():
         referrer = User.query.filter_by(referral_code=ref_code).first()
         if not referrer:
             return jsonify({"success": False, "message": "Invalid referral code."}), 400
-        # Prevent self-referral
+        # Prevent self-referral by email or phone
         if referrer.email == email or referrer.phone == phone:
             return jsonify({"success": False, "message": "You cannot refer yourself."}), 400
+        # Prevent same IP being referred more than once by the same referrer
+        existing_ip_ref = User.query.filter_by(
+            referred_by=ref_code, signup_ip=ip
+        ).first()
+        if existing_ip_ref:
+            return jsonify({"success": False,
+                "message": "A referral from your network already exists."}), 400
+        # Referrer cannot refer from their own IP (prevent self-farming with VPN)
+        if referrer.signup_ip and referrer.signup_ip == ip:
+            return jsonify({"success": False,
+                "message": "You cannot refer someone from the same network."}), 400
+        # Cap: max 20 referrals per user
+        existing_refs = User.query.filter_by(referred_by=ref_code).count()
+        if existing_refs >= 20:
+            return jsonify({"success": False,
+                "message": "This referral code has reached its limit."}), 400
 
     new_user = User(
         username=username,
@@ -259,13 +275,13 @@ def create_user():
         balance=2.0,
         total_earned=2.0,
         upgrades_owned="{}",
+        signup_ip=ip,
     )
     db.session.add(new_user)
-
     db.session.commit()
 
-    # Credit referral signup bonus only after referred user buys iron pickaxe
-    # (done in buy-upgrade route) — not on signup to prevent fake account farming
+    # Referral bonus is credited in /api/buy-upgrade when iron pickaxe is bought
+    # This prevents fake account farming — they must actually spend gems
 
     # Generate token and log user in immediately
     import secrets
@@ -531,11 +547,13 @@ def sync_state():
                 user.total_earned += gems_earned
                 user.mining_start  = None
 
-                # ── 10% referral cut ──
+                # ── 10% referral cut — only if not same IP ──
                 if user.referred_by and gems_earned > 0:
                     cut = round(gems_earned * 0.10, 6)
                     referrer = User.query.filter_by(referral_code=user.referred_by).first()
-                    if referrer and cut > 0:
+                    same_ip = (user.signup_ip and referrer and
+                               referrer.signup_ip == user.signup_ip)
+                    if referrer and cut > 0 and not same_ip:
                         referrer.balance      += cut
                         referrer.total_earned += cut
                         print(f'[REFERRAL CUT] {referrer.username} +{cut:.4f} gems')
@@ -593,16 +611,26 @@ def buy_upgrade():
     # Iron pickaxe special flag + referral bonus
     if upg_id == 't2' and not user.has_iron_pickaxe:
         user.has_iron_pickaxe = True
-        # Credit referrer 10 gems NOW (after real purchase)
+        # Credit referrer only after strict anti-abuse checks
         if user.referred_by:
             referrer = User.query.filter_by(referral_code=user.referred_by).first()
             if referrer and referrer.username != user.username:
-                # Anti-abuse: check referred user account is at least 1 day old
-                account_age_hours = (datetime.utcnow() - user.created_at).total_seconds() / 3600
-                if account_age_hours >= 1:
+                now = datetime.utcnow()
+                account_age_hours = (now - user.created_at).total_seconds() / 3600
+
+                # Check 1: account must be at least 24 hours old
+                if account_age_hours < 24:
+                    print(f'[REFERRAL BLOCKED] {user.username} account too new ({account_age_hours:.1f}h)')
+                # Check 2: referred user and referrer must not share IP
+                elif user.signup_ip and referrer.signup_ip and user.signup_ip == referrer.signup_ip:
+                    print(f'[REFERRAL BLOCKED] {user.username} same IP as referrer {referrer.username}')
+                # Check 3: referrer must have been active (has mined something)
+                elif referrer.total_earned < 2.0:
+                    print(f'[REFERRAL BLOCKED] referrer {referrer.username} has not mined yet')
+                else:
                     referrer.balance      += 10.0
                     referrer.total_earned += 10.0
-                    print(f'[REFERRAL] {referrer.username} earned +10 gems (from {user.username} buying iron pickaxe)')
+                    print(f'[REFERRAL] {referrer.username} earned +10 gems (from {user.username})')
 
     db.session.commit()
 

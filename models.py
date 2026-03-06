@@ -50,6 +50,7 @@ class User(db.Model):
     otp_attempts      = db.Column(db.Integer, default=0)   # wrong OTP attempts
 
     created_at        = db.Column(db.DateTime, default=datetime.utcnow)
+    signup_ip         = db.Column(db.String(45), nullable=True)   # IPv4/IPv6
 
     def to_dict(self):
         return {
