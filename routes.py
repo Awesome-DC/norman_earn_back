@@ -969,13 +969,21 @@ def get_referrals(username):
 
     verified = []
     pending  = []
+    now = datetime.utcnow()
     for r in referred_users:
+        # Check if bonus was blocked for this referral
+        age_hours   = (now - r.created_at).total_seconds() / 3600
+        same_ip     = (r.signup_ip and user.signup_ip and r.signup_ip == user.signup_ip)
+        bonus_blocked = same_ip or age_hours < 24
+
         entry = {
             "username":        r.username,
             "joined":          r.created_at.strftime("%Y-%m-%d"),
             "is_verified":     r.is_verified,
             "has_iron_pickaxe":r.has_iron_pickaxe,
             "earned":          r.total_earned,
+            "bonus_blocked":   bonus_blocked,
+            "block_reason":    ("Same network" if same_ip else "Account too new") if bonus_blocked else None,
         }
         if r.is_verified and r.has_iron_pickaxe:
             verified.append(entry)
