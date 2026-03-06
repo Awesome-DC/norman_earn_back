@@ -128,3 +128,25 @@ class WithdrawalRequest(db.Model):
             "processed_at": self.processed_at.isoformat() if self.processed_at else None,
             "admin_note":   self.admin_note,
         }
+
+
+class SecurityStrike(db.Model):
+    """Persistent strike counter — never resets, survives server restarts."""
+    __tablename__ = 'security_strike'
+    id         = db.Column(db.Integer, primary_key=True)
+    key        = db.Column(db.String(200), unique=True, nullable=False)  # e.g. "strike_signup_1.2.3.4"
+    count      = db.Column(db.Integer, default=1)
+    first_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    last_seen  = db.Column(db.DateTime, default=datetime.utcnow)
+    last_username = db.Column(db.String(100), nullable=True)
+    last_email    = db.Column(db.String(200), nullable=True)
+
+    def to_dict(self):
+        return {
+            "key":           self.key,
+            "count":         self.count,
+            "first_seen":    self.first_seen.isoformat(),
+            "last_seen":     self.last_seen.isoformat(),
+            "last_username": self.last_username,
+            "last_email":    self.last_email,
+        }

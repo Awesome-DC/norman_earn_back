@@ -5,7 +5,7 @@ load_dotenv()
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
-from models import db, User, WithdrawalRequest, DailyQuest
+from models import db, User, WithdrawalRequest, DailyQuest, SecurityStrike
 from datetime import datetime, timedelta
 from functools import wraps
 import secrets
@@ -34,15 +34,37 @@ def rate_limit(key, max_calls, window_seconds):
     entry['count'] += 1
     return True, 0
 
-# Strike counter — persists across rate limit windows (DB-backed via User table)
-_strike_store = {}
+# Strike counter — DB-backed, never resets on server restart
+_strike_store = {}  # fallback cache
 
-def increment_strike(key):
-    _strike_store[key] = _strike_store.get(key, 0) + 1
-    return _strike_store[key]
+def increment_strike(key, username=None, email=None):
+    """Increment DB strike counter. Returns new count."""
+    try:
+        record = SecurityStrike.query.filter_by(key=key).first()
+        if record:
+            record.count     += 1
+            record.last_seen  = datetime.utcnow()
+            if username: record.last_username = username
+            if email:    record.last_email    = email
+        else:
+            record = SecurityStrike(
+                key=key, count=1,
+                last_username=username, last_email=email
+            )
+            db.session.add(record)
+        db.session.commit()
+        return record.count
+    except Exception:
+        # Fallback to in-memory if DB fails
+        _strike_store[key] = _strike_store.get(key, 0) + 1
+        return _strike_store[key]
 
 def get_strikes(key):
-    return _strike_store.get(key, 0)
+    try:
+        record = SecurityStrike.query.filter_by(key=key).first()
+        return record.count if record else 0
+    except Exception:
+        return _strike_store.get(key, 0)
 
 # ── Bot / abuse detection helpers ──
 BOT_SIGNALS = [
@@ -120,6 +142,15 @@ def run_migrations(app):
             'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS signup_ip VARCHAR(45)',
             'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false',
             'ALTER TABLE daily_quest ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true',
+            '''CREATE TABLE IF NOT EXISTS security_strike (
+                id SERIAL PRIMARY KEY,
+                key VARCHAR(200) UNIQUE NOT NULL,
+                count INTEGER DEFAULT 1,
+                first_seen TIMESTAMP DEFAULT NOW(),
+                last_seen TIMESTAMP DEFAULT NOW(),
+                last_username VARCHAR(100),
+                last_email VARCHAR(200)
+            )''',
         ]
         with db.engine.begin() as conn:
             for stmt in migrations:
@@ -324,36 +355,38 @@ def create_user():
     # Get real IP — Railway/Render proxy sets X-Forwarded-For
     ip = (request.headers.get('X-Forwarded-For') or request.remote_addr or '').split(',')[0].strip()
 
-    # ── Bot detection — check BEFORE parsing body ──
-    bot, bot_reason = is_bot_request()
-    if bot:
-        send_security_alert("rate_limit", {
-            "username": "BOT",
-            "email":    "N/A",
-            "ip":       ip,
-            "ref_code": request.get_json(silent=True, force=True) and (request.get_json(silent=True, force=True).get('referral_code') or 'none') or 'none',
-            "strikes":  increment_strike(f'strike_signup_{ip}'),
-            "reason":   f"Bot/script detected: {bot_reason}"
-        })
-        # Return fake success to confuse scripts
-        return jsonify({"success": True, "message": "Account created!", "token": "invalid"}), 200
-
-    # Parse body
-    data = request.get_json()
-    if not data:
-        return jsonify({"success": False, "message": "No data received."}), 400
-
+    # Parse body first so we always have user details for alerts
+    data = request.get_json(silent=True, force=True) or {}
     username = (data.get('username') or '').strip()
     email    = (data.get('email')    or '').strip().lower()
     phone    = (data.get('phone')    or '').strip()
     password = (data.get('password') or '')
     ref_code = (data.get('referral_code') or '').strip().upper()
 
+    if not data:
+        return jsonify({"success": False, "message": "No data received."}), 400
+
+    # ── Bot detection ──
+    bot, bot_reason = is_bot_request()
+    if bot:
+        ref_user = User.query.filter_by(referral_code=ref_code).first() if ref_code else None
+        strikes  = increment_strike(f'strike_signup_{ip}', username=username, email=email)
+        send_security_alert("rate_limit", {
+            "username":       username       or "unknown",
+            "email":          email          or "N/A",
+            "ip":             ip,
+            "ref_code":       ref_code       or "none",
+            "referrer":       ref_user.username if ref_user else None,
+            "referrer_email": ref_user.email    if ref_user else None,
+            "strikes":        strikes,
+            "reason":         f"Bot/script detected: {bot_reason}"
+        })
+        # Return fake success to confuse scripts
+        return jsonify({"success": True, "message": "Account created!", "token": "invalid"}), 200
+
     # Max 2 signups per IP per day
     allowed, retry = rate_limit(f'signup_{ip}', 2, 86400)
     if not allowed:
-        strikes = increment_strike(f'strike_signup_{ip}')
-
         # Get referrer real info
         referrer_info = None
         if ref_code:
@@ -368,7 +401,7 @@ def create_user():
             "ref_code":         ref_code  or "none",
             "referrer":         referrer_info["username"] if referrer_info else None,
             "referrer_email":   referrer_info["email"]    if referrer_info else None,
-            "strikes":          strikes,
+            "strikes":          increment_strike(f'strike_signup_{ip}', username=username, email=email),
             "reason":           "Hit signup rate limit (2/day) — possible bot/spam"
         })
         # Real users get a helpful message, bots already got fake success above
