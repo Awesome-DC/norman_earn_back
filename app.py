@@ -81,6 +81,12 @@ with app.app_context():
     except Exception as e:
         print(f'[DB] Phone column already correct or error: {e}')
     print('[DB] Tables ready.')
+    # Run column migrations for new fields
+    try:
+        from routes import run_migrations
+        run_migrations(app)
+    except Exception as e:
+        print(f'[MIGRATION ERROR] {e}')
 
 if __name__ == '__main__':
     app.run(debug=True)

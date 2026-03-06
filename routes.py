@@ -79,6 +79,24 @@ def require_admin(f):
         return f(*args, **kwargs)
     return decorated
 
+# ── Auto-migrate missing columns on startup ──
+def run_migrations(app):
+    """Add any missing columns to existing DB without dropping data."""
+    with app.app_context():
+        from sqlalchemy import text as _text
+        migrations = [
+            'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS signup_ip VARCHAR(45)',
+            'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false',
+            'ALTER TABLE daily_quest ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true',
+        ]
+        with db.engine.begin() as conn:
+            for stmt in migrations:
+                try:
+                    conn.execute(_text(stmt))
+                except Exception as e:
+                    print(f"[MIGRATION] {stmt[:50]}... -> {e}")
+        print("[MIGRATION] Done.")
+
 # ── Helpers ──
 def gen_referral_code(username):
     suffix = secrets.token_hex(3).upper()
@@ -93,6 +111,57 @@ def gen_session_token():
 # Telegram config — set these to match your telegram_bot.py
 TELEGRAM_BOT_TOKEN    = os.getenv('BOT_TOKEN', '')
 TELEGRAM_ADMIN_CHATID = int(os.getenv('ADMIN_CHAT_ID', '0'))
+
+
+def send_security_alert(alert_type, details: dict):
+    """Send a security/fraud alert to admin Telegram immediately."""
+    import threading
+    def _send():
+        try:
+            if not TELEGRAM_BOT_TOKEN or TELEGRAM_ADMIN_CHATID == 0:
+                return
+            icons = {
+                "referral_farm":   "🚨",
+                "same_ip_ref":     "⚠️",
+                "suspicious_bal":  "💰",
+                "rate_limit":      "🛑",
+                "banned_ip":       "🔒",
+                "fake_withdraw":   "💸",
+            }
+            icon = icons.get(alert_type, "🚨")
+            lines = [
+                f"{icon} *SECURITY ALERT — {alert_type.replace('_',' ').upper()}*",
+                "",
+            ]
+            if details.get("username"):
+                lines.append(f"👤 Username: `{details['username']}`")
+            if details.get("email"):
+                lines.append(f"📧 Email: `{details['email']}`")
+            if details.get("ip"):
+                lines.append(f"🌐 IP: `{details['ip']}`")
+            if details.get("ref_code"):
+                lines.append(f"🔗 Ref Code: `{details['ref_code']}`")
+            if details.get("referrer"):
+                lines.append(f"👥 Referrer: `{details['referrer']}`")
+            if details.get("balance"):
+                lines.append(f"💎 Balance: `{details['balance']}`")
+            if details.get("reason"):
+                lines.append(f"📝 Reason: {details['reason']}")
+            lines.append("")
+            lines.append("_Use /ban <username> to ban this user._")
+
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id":    TELEGRAM_ADMIN_CHATID,
+                    "text":       "\n".join(lines),
+                    "parse_mode": "Markdown",
+                },
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"[SECURITY ALERT ERROR] {e}")
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def send_telegram_alert(w):
@@ -208,6 +277,10 @@ def create_user():
     # Max 2 signups per IP per day (down from 5)
     allowed, retry = rate_limit(f'signup_{ip}', 2, 86400)
     if not allowed:
+        send_security_alert("rate_limit", {
+            "ip": ip,
+            "reason": f"IP {ip} hit signup rate limit (2/day) — possible bot/spam"
+        })
         return jsonify({"success": False,
             "message": "Too many signups from your network today. Try again tomorrow."}), 429
 
@@ -252,10 +325,20 @@ def create_user():
             referred_by=ref_code, signup_ip=ip
         ).first()
         if existing_ip_ref:
+            send_security_alert("referral_farm", {
+                "username": username, "email": email, "ip": ip,
+                "ref_code": ref_code, "referrer": referrer.username,
+                "reason": f"IP {ip} already has a referred account under this code"
+            })
             return jsonify({"success": False,
                 "message": "A referral from your network already exists."}), 400
         # Referrer cannot refer from their own IP (prevent self-farming with VPN)
         if referrer.signup_ip and referrer.signup_ip == ip:
+            send_security_alert("same_ip_ref", {
+                "username": username, "email": email, "ip": ip,
+                "ref_code": ref_code, "referrer": referrer.username,
+                "reason": "Signup IP matches referrer's IP — possible self-farm"
+            })
             return jsonify({"success": False,
                 "message": "You cannot refer someone from the same network."}), 400
         # Cap: max 20 referrals per user
@@ -620,10 +703,20 @@ def buy_upgrade():
 
                 # Check 1: account must be at least 24 hours old
                 if account_age_hours < 24:
-                    print(f'[REFERRAL BLOCKED] {user.username} account too new ({account_age_hours:.1f}h)')
+                    send_security_alert("referral_farm", {
+                        "username": user.username, "email": user.email,
+                        "ip": user.signup_ip, "ref_code": user.referred_by,
+                        "referrer": referrer.username,
+                        "reason": f"Account only {account_age_hours:.1f}h old — referral bonus blocked"
+                    })
                 # Check 2: referred user and referrer must not share IP
                 elif user.signup_ip and referrer.signup_ip and user.signup_ip == referrer.signup_ip:
-                    print(f'[REFERRAL BLOCKED] {user.username} same IP as referrer {referrer.username}')
+                    send_security_alert("same_ip_ref", {
+                        "username": user.username, "email": user.email,
+                        "ip": user.signup_ip, "ref_code": user.referred_by,
+                        "referrer": referrer.username,
+                        "reason": "Referred user shares IP with referrer — bonus blocked"
+                    })
                 # Check 3: referrer must have been active (has mined something)
                 elif referrer.total_earned < 2.0:
                     print(f'[REFERRAL BLOCKED] referrer {referrer.username} has not mined yet')
@@ -811,7 +904,11 @@ def withdraw():
     # 6. Balance sanity check — flag suspiciously high balances
     MAX_LEGIT_BALANCE = 100000  # adjust as needed
     if user.balance > MAX_LEGIT_BALANCE:
-        print(f'[FRAUD ALERT] {user.username} has suspicious balance: {user.balance:.2f} gems')
+        send_security_alert("suspicious_bal", {
+            "username": user.username, "email": user.email,
+            "ip": request.remote_addr, "balance": f"{user.balance:.2f} gems",
+            "reason": f"Attempted withdrawal with balance {user.balance:.2f} gems (max legit: {MAX_LEGIT_BALANCE})"
+        })
         return jsonify({"success": False, "message": "Your account has been flagged for review. Contact support."}), 403
 
     # 5% transaction fee — deduct full amount, user receives 95%
