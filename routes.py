@@ -5,7 +5,7 @@ load_dotenv()
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.security import generate_password_hash, check_password_hash
-from models import db, User, WithdrawalRequest
+from models import db, User, WithdrawalRequest, DailyQuest
 from datetime import datetime, timedelta
 from functools import wraps
 import secrets
