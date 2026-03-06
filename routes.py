@@ -955,38 +955,70 @@ def buy_iron_pickaxe():
 # ══════════════════════════════════════════
 @main_routes.route('/api/forgot-password', methods=['POST'])
 def forgot_password():
-    data  = request.get_json()
-    email = (data.get('email') or '').strip().lower()
+    """
+    Verify identity using 2 of 3: username, email, phone.
+    No OTP needed — if 2 fields match, return a reset token.
+    """
+    data     = request.get_json()
+    ip       = (request.headers.get('X-Forwarded-For') or request.remote_addr or '').split(',')[0].strip()
+    username = (data.get('username') or '').strip().lower()
+    email    = (data.get('email')    or '').strip().lower()
+    phone    = (data.get('phone')    or '').strip()
 
-    if not email:
-        return jsonify({"success": False, "message": "Email is required."}), 400
+    # Count how many fields were provided
+    provided = [f for f in [username, email, phone] if f]
+    if len(provided) < 2:
+        return jsonify({"success": False, "message": "Please fill in at least 2 of the 3 fields."}), 400
 
-    # Rate limit: max 3 password reset requests per email per hour
-    allowed, retry = rate_limit(f'forgot_{email}', 3, 3600)
+    # Rate limit: max 5 attempts per IP per hour
+    allowed, retry = rate_limit(f'forgot_{ip}', 5, 3600)
     if not allowed:
         return jsonify({"success": False,
-            "message": f"Too many reset requests. Wait {retry//60+1} minute(s)."}), 429
+            "message": f"Too many attempts. Try again in {retry//60+1} minute(s)."}), 429
 
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({"success": False, "message": "No account found with that email address."}), 404
+    # Try to find the user — must match on at least 2 provided fields
+    user = None
+    matches = 0
 
-    otp = gen_otp()
-    user.otp_code    = otp
-    user.otp_expires = datetime.utcnow() + timedelta(minutes=15)
+    # Build candidates from each provided field
+    candidates = set()
+    if username:
+        u = User.query.filter_by(username=username).first()
+        if u: candidates.add(u.id)
+    if email:
+        u = User.query.filter_by(email=email).first()
+        if u: candidates.add(u.id)
+    if phone:
+        u = User.query.filter_by(phone=phone).first()
+        if u: candidates.add(u.id)
+
+    # If all provided fields point to same user, count how many matched
+    if len(candidates) == 1:
+        uid  = next(iter(candidates))
+        user = User.query.get(uid)
+        # Count how many of the provided fields actually match this user
+        if username and user.username.lower() == username: matches += 1
+        if email    and user.email.lower()    == email:    matches += 1
+        if phone    and user.phone            == phone:    matches += 1
+
+    if not user or matches < 2:
+        # Vague error — don't reveal which field is wrong
+        return jsonify({"success": False,
+            "message": "Could not verify identity. Check your details and try again."}), 404
+
+    # Identity verified — generate a short-lived reset token
+    reset_token = secrets.token_hex(24)
+    user.otp_code    = reset_token
+    user.otp_expires = datetime.utcnow() + timedelta(minutes=30)
+    user.otp_attempts = 0
     db.session.commit()
 
-    try:
-        send_otp_email(user, otp,
-            subject="🔐 Norman-Earn Password Reset Code",
-            heading="Password Reset Request",
-            body_text="Use the code below to reset your password."
-        )
-    except Exception as e:
-        print(f"[EMAIL ERROR]: {e}")
-        return jsonify({"success": False, "message": "Failed to send email. Try again."}), 500
-
-    return jsonify({"success": True, "message": f"Reset code sent to {email}."})
+    return jsonify({
+        "success":     True,
+        "reset_token": reset_token,
+        "username":    user.username,
+        "message":     "Identity verified! You can now reset your password.",
+    })
 
 
 # ══════════════════════════════════════════
@@ -1031,28 +1063,33 @@ def verify_reset_otp():
 @main_routes.route('/api/reset-password', methods=['POST'])
 def reset_password():
     data         = request.get_json()
-    email        = (data.get('email')        or '').strip().lower()
+    reset_token  = (data.get('reset_token')  or '').strip()
     new_password = (data.get('new_password') or '')
 
-    if not email or not new_password:
-        return jsonify({"success": False, "message": "Email and new password are required."}), 400
-    if len(new_password) < 6:
-        return jsonify({"success": False, "message": "Password must be at least 6 characters."}), 400
+    if not reset_token or not new_password:
+        return jsonify({"success": False, "message": "Reset token and new password are required."}), 400
+    if len(new_password) < 7:
+        return jsonify({"success": False, "message": "Password must be at least 7 characters."}), 400
+    if not re.search(r'\d', new_password):
+        return jsonify({"success": False, "message": "Password must contain at least one number."}), 400
 
-    user = User.query.filter_by(email=email).first()
+    user = User.query.filter_by(otp_code=reset_token).first()
     if not user:
-        return jsonify({"success": False, "message": "Account not found."}), 404
-    if not user.otp_code or user.otp_expires < datetime.utcnow():
+        return jsonify({"success": False, "message": "Invalid or expired reset session. Start over."}), 404
+    if user.otp_expires < datetime.utcnow():
+        user.otp_code = None; user.otp_expires = None
+        db.session.commit()
         return jsonify({"success": False, "message": "Session expired. Please start over."}), 400
 
-    user.password    = generate_password_hash(new_password)
-    user.otp_code    = None
-    user.otp_expires = None
-    user.is_verified = True
-    user.session_token = None  # force re-login after reset
+    user.password      = generate_password_hash(new_password)
+    user.otp_code      = None
+    user.otp_expires   = None
+    user.otp_attempts  = 0
+    user.is_verified   = True
+    user.session_token = None  # force re-login
     db.session.commit()
 
-    return jsonify({"success": True, "message": "Password reset successfully!"})
+    return jsonify({"success": True, "message": "Password reset successfully! Please log in."})
 
 
 # ══════════════════════════════════════════
