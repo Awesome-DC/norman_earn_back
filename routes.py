@@ -142,6 +142,7 @@ def run_migrations(app):
             'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS signup_ip VARCHAR(45)',
             'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT false',
             'ALTER TABLE daily_quest ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true',
+            'ALTER TABLE "user" ALTER COLUMN otp_code TYPE VARCHAR(64)',
             '''CREATE TABLE IF NOT EXISTS security_strike (
                 id SERIAL PRIMARY KEY,
                 key VARCHAR(200) UNIQUE NOT NULL,
