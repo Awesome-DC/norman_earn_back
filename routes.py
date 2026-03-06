@@ -582,6 +582,82 @@ def get_profile():
 # ══════════════════════════════════════════
 #  SYNC MINING STATE — save balance/upgrades/mining_start to DB
 # ══════════════════════════════════════════
+# ══════════════════════════════════════════
+#  START MINING
+# ══════════════════════════════════════════
+@main_routes.route('/api/start-mining', methods=['POST'])
+@require_auth
+def start_mining():
+    user = request.current_user
+    now  = datetime.utcnow()
+
+    if user.mining_start:
+        # Already mining — return current state
+        elapsed = (now - user.mining_start).total_seconds()
+        return jsonify({
+            "success":      True,
+            "mining_start": user.mining_start.isoformat(),
+            "elapsed":      elapsed,
+            "already_mining": True,
+        })
+
+    user.mining_start = now
+    db.session.commit()
+    return jsonify({
+        "success":      True,
+        "mining_start": user.mining_start.isoformat(),
+        "already_mining": False,
+    })
+
+
+# ══════════════════════════════════════════
+#  CLAIM MINING
+# ══════════════════════════════════════════
+@main_routes.route('/api/claim-mining', methods=['POST'])
+@require_auth
+def claim_mining():
+    user = request.current_user
+    now  = datetime.utcnow()
+
+    if not user.mining_start:
+        return jsonify({"success": False, "message": "Not currently mining."}), 400
+
+    elapsed = (now - user.mining_start).total_seconds()
+    elapsed = min(elapsed, 86400)  # cap at 24h
+
+    # Calculate gems earned server-side
+    owned = json.loads(user.upgrades_owned or '{}')
+    BOOSTS = {
+        't1':0.05,'t2':0.12,'t3':0.28,'t4':0.55,'t5':2.0,'t6':4.5,
+        'w1':0.06,'w2':0.14,'w3':0.32,'w4':0.65,'w5':2.8,'w6':5.5,
+        'm1':0.08,'m2':0.16,'m3':0.42,'m4':0.80,'m5':3.2,'m6':6.5,
+    }
+    boost       = sum(BOOSTS.get(k, 0) * v for k, v in owned.items())
+    rate        = BASE_GEMS_PER_SECOND * (1 + boost)
+    gems_earned = round(rate * elapsed, 6)
+
+    user.balance      += gems_earned
+    user.total_earned += gems_earned
+    user.mining_start  = None
+
+    # 10% referral cut
+    if user.referred_by and gems_earned > 0:
+        referrer = User.query.filter_by(referral_code=user.referred_by).first()
+        same_ip  = (user.signup_ip and referrer and referrer.signup_ip == user.signup_ip)
+        if referrer and not same_ip:
+            cut = round(gems_earned * 0.10, 6)
+            referrer.balance      += cut
+            referrer.total_earned += cut
+
+    db.session.commit()
+    return jsonify({
+        "success":      True,
+        "gems_earned":  gems_earned,
+        "balance":      user.balance,
+        "total_earned": user.total_earned,
+    })
+
+
 # ── Mining constants (must match frontend) ──
 BASE_GEMS_PER_SECOND = (10 / 24) / 3600   # 10 gems/day → per second
 MAX_SINGLE_CYCLE     = 10.5                # max gems one 24hr cycle can earn
