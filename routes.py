@@ -262,12 +262,10 @@ def create_user():
     )
     db.session.add(new_user)
 
-    # Credit referrer if valid
-    if referrer:
-        referrer.balance      += 10.0
-        referrer.total_earned += 10.0
-
     db.session.commit()
+
+    # Credit referral signup bonus only after referred user buys iron pickaxe
+    # (done in buy-upgrade route) — not on signup to prevent fake account farming
 
     # Generate token and log user in immediately
     import secrets
@@ -489,16 +487,8 @@ def sync_state():
 
     # ── ONLY accept upgrades_owned and mining_start from frontend ──
     # NEVER trust balance or total_earned from client
-    if 'upgrades_owned' in data:
-        raw = data['upgrades_owned']
-        # Validate it's a dict of known upgrade keys only
-        VALID_KEYS = {'t1','t2','t3','t4','t5','t6','w1','w2','w3','w4','w5','w6','m1','m2','m3','m4','m5','m6'}
-        if isinstance(raw, dict):
-            clean = {}
-            for k, v in raw.items():
-                if k in VALID_KEYS and isinstance(v, (int, float)) and 0 <= v <= 10000:
-                    clean[k] = int(v)
-            user.upgrades_owned = json.dumps(clean)
+    # upgrades_owned is now managed by /api/buy-upgrade — ignore from sync
+    # Only accept mining_start from frontend
 
     if 'mining_start' in data:
         ms = data['mining_start']
@@ -564,15 +554,83 @@ def sync_state():
 # ══════════════════════════════════════════
 #  BUY IRON PICKAXE — mark on backend
 # ══════════════════════════════════════════
+# ══════════════════════════════════════════
+#  BUY UPGRADE — server validates cost & deducts balance
+# ══════════════════════════════════════════
+UPGRADE_COSTS = {
+    't1':1,   't2':3,   't3':8,   't4':18,  't5':20,  't6':35,
+    'w1':1.5, 'w2':4,   'w3':10,  'w4':20,  'w5':22,  'w6':38,
+    'm1':2,   'm2':4,   'm3':12,  'm4':22,  'm5':24,  'm6':40,
+}
+MAX_UPGRADE_QTY = 10000  # max quantity per upgrade type
+
+@main_routes.route('/api/buy-upgrade', methods=['POST'])
+@require_auth
+def buy_upgrade():
+    user = request.current_user
+    data = request.get_json()
+    upg_id = (data.get('upgrade_id') or '').strip()
+
+    if upg_id not in UPGRADE_COSTS:
+        return jsonify({"success": False, "message": "Invalid upgrade."}), 400
+
+    cost = UPGRADE_COSTS[upg_id]
+
+    if user.balance < cost:
+        return jsonify({"success": False, "message": f"Insufficient balance. Need {cost} gems."}), 400
+
+    owned = json.loads(user.upgrades_owned or '{}')
+    current_qty = owned.get(upg_id, 0)
+
+    if current_qty >= MAX_UPGRADE_QTY:
+        return jsonify({"success": False, "message": "Maximum quantity reached for this upgrade."}), 400
+
+    # Deduct cost and add upgrade server-side
+    user.balance -= cost
+    owned[upg_id] = current_qty + 1
+    user.upgrades_owned = json.dumps(owned)
+
+    # Iron pickaxe special flag + referral bonus
+    if upg_id == 't2' and not user.has_iron_pickaxe:
+        user.has_iron_pickaxe = True
+        # Credit referrer 10 gems NOW (after real purchase)
+        if user.referred_by:
+            referrer = User.query.filter_by(referral_code=user.referred_by).first()
+            if referrer and referrer.username != user.username:
+                # Anti-abuse: check referred user account is at least 1 day old
+                account_age_hours = (datetime.utcnow() - user.created_at).total_seconds() / 3600
+                if account_age_hours >= 1:
+                    referrer.balance      += 10.0
+                    referrer.total_earned += 10.0
+                    print(f'[REFERRAL] {referrer.username} earned +10 gems (from {user.username} buying iron pickaxe)')
+
+    db.session.commit()
+
+    return jsonify({
+        "success":        True,
+        "message":        "Upgrade purchased!",
+        "balance":        user.balance,
+        "upgrades_owned": owned,
+    })
+
+
 @main_routes.route('/api/buy-iron-pickaxe', methods=['POST'])
 @require_auth
 def buy_iron_pickaxe():
     user = request.current_user
+    # Iron pickaxe costs 3 gems (t2) — check balance before granting
+    IRON_PICKAXE_COST = 3.0
+    if user.has_iron_pickaxe:
+        return jsonify({"success": True, "message": "Already owned.", "now_valid_referral": bool(user.referred_by)})
+    if user.balance < IRON_PICKAXE_COST:
+        return jsonify({"success": False, "message": "Insufficient balance to buy Iron Pickaxe."}), 400
+    user.balance -= IRON_PICKAXE_COST
     user.has_iron_pickaxe = True
     db.session.commit()
     return jsonify({
         "success": True,
-        "message": "Iron Pickaxe recorded.",
+        "message": "Iron Pickaxe purchased!",
+        "balance": user.balance,
         "now_valid_referral": bool(user.referred_by),
     })
 
